@@ -1,6 +1,6 @@
 let FLICKER_HZ   = 40;
 let MEAN_ALPHA  = 0.10;
-let MOD_DEPTH   = 0.05;
+let MOD_DEPTH   = 5;
 let CHECKER_SIZE = 8;
 
 let p5Colors = null;
@@ -16,6 +16,13 @@ const JITTER_THRESHOLD = 2; // ms deviation from ideal frame
 let frameCount = 0;
 let prevFrameMs = null;
 let rafJitterEvents = 0;
+
+// Pattern5 debug
+let p5ZeroCrossings = 0;
+let p5LastSign = 0;
+let p5WindowStart = performance.now();
+let p5FrameCounter = 0;
+
 
 
 console.log("[CONTENT] injected on", location.href);
@@ -89,7 +96,7 @@ function suggestOverlayColors(bgRgbStr) {
   if (!rgb) return null;
 
   const L = luminance(rgb);
-  const DELTA = 10;
+  const DELTA = 100;
 
   let base;
   if (L < 0.25) {
@@ -329,27 +336,98 @@ function pattern4Update(dt) {
     alpha: meanAlpha + MOD_DEPTH * (w * 2 - 1),
   };
 }
+function parseColorString(str) {
+  const m = str.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+  return m ? { r: +m[1], g: +m[2], b: +m[3] } : null;
+}
+function renderPattern5Integrated(t0, t1) {
+  if (!p5Colors || !p5Colors.rgbA || !p5Colors.rgbB) return;
 
-// ---------- Pattern 5 ----------
-function renderPattern5(now) {
-  if (!p5Colors) return;
+  const f = FLICKER_HZ;
+  const dt = t1 - t0;
+  if (dt <= 0) return;
 
-  const halfPeriod = 1000 / (FLICKER_HZ * 2);
-  if (now - p5LastFlip >= halfPeriod) {
-    p5Phase ^= 1;
-    p5LastFlip = now;
+  const period = 1 / f;
+  const half = period / 2;
 
-    // console.log(
-    //   `[P5] flip phase=${p5Phase} @ ${Math.round(now)} ms`
-    // );
+  let phaseLocal = ((t0 % period) + period) % period;
+  let remaining = dt;
+  let onTime = 0;
+
+  while (remaining > 0) {
+    const inA = phaseLocal < half;
+    const nextBoundary = inA ? half : period;
+    const segment = Math.min(remaining, nextBoundary - phaseLocal);
+
+    if (inA) onTime += segment;
+
+    remaining -= segment;
+    phaseLocal += segment;
+    if (phaseLocal >= period) phaseLocal -= period;
   }
 
+  const fractionA = onTime / dt;
+  const fractionB = 1 - fractionA;
+
+  const A = p5Colors.rgbA;
+  const B = p5Colors.rgbB;
+
+  const r = Math.round(A.r * fractionA + B.r * fractionB);
+  const g = Math.round(A.g * fractionA + B.g * fractionB);
+  const b = Math.round(A.b * fractionA + B.b * fractionB);
+
+  // Render
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.globalAlpha = clamp01(meanAlpha);
-  ctx.fillStyle = p5Phase ? p5Colors.modA : p5Colors.modB;
+  ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.globalAlpha = 1;
+
+  // -----------------------
+  // DEBUG SECTION
+  // -----------------------
+  if (DEBUG) {
+    p5FrameCounter++;
+
+    // Detect sign flips for alias frequency estimation
+    const M = fractionA * 2 - 1;  // convert to [-1,1] for analysis
+    const s = Math.sign(M);
+
+    if (s !== 0 && s !== p5LastSign) {
+      p5ZeroCrossings++;
+      p5LastSign = s;
+    }
+
+    const now = performance.now();
+
+    // Log frequency every 2 seconds
+    if (now - p5WindowStart > 2000) {
+      const seconds = (now - p5WindowStart) / 1000;
+      const estFreq = (p5ZeroCrossings / 2) / seconds;
+
+      console.log(
+        `[Pattern5 Integrated]
+        estFreq≈${estFreq.toFixed(2)}Hz
+        avgFractionA≈${fractionA.toFixed(3)}
+        dt≈${(dt * 1000).toFixed(2)}ms`
+      );
+
+      p5ZeroCrossings = 0;
+      p5WindowStart = now;
+    }
+
+    // Occasionally inspect color blend
+    if (p5FrameCounter % LOG_EVERY_N === 0) {
+      console.log(
+        `[Pattern5 Blend]
+        fractionA=${fractionA.toFixed(3)}
+        rgb=(${r},${g},${b})`
+      );
+    }
+  }
 }
+
+
 
 function loop(now) {
   if (!running) return;
@@ -372,7 +450,7 @@ if (prevFrameMs !== null) {
   }
 }
 
-prevFrameMs = now;
+  prevFrameMs = now;
 
 
   const nowSec = now / 1000;
@@ -391,10 +469,11 @@ prevFrameMs = now;
   let cmd;
 
   if (currentPattern === 5) {
-    renderPattern5(now);
+    renderPattern5Integrated(t0, t1);
     rafId = requestAnimationFrame(loop);
     return;
   }
+
 
   switch (currentPattern) {
     case 1:
@@ -432,6 +511,9 @@ function start(pattern = currentPattern) {
   if (currentPattern === 5) {
     const bg = getEffectiveBackgroundColor(innerWidth / 2, innerHeight / 2);
     p5Colors = suggestOverlayColors(bg);
+    p5Colors.rgbA = parseColorString(p5Colors.modA);
+    p5Colors.rgbB = parseColorString(p5Colors.modB);
+
     p5Phase = 0;
     p5LastFlip = performance.now();
 
@@ -445,6 +527,7 @@ function start(pattern = currentPattern) {
 
   running = true;
   lastTime = performance.now();
+  lastNowSec = 0;
   rafId = requestAnimationFrame(loop);
 }
 
