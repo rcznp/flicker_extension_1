@@ -1,23 +1,26 @@
-// =====================================================
-// CONFIG
-// =====================================================
 let FLICKER_HZ   = 40;
 let MEAN_ALPHA  = 0.10;
 let MOD_DEPTH   = 0.05;
 let CHECKER_SIZE = 8;
 
-// ---------- Pattern 5 (Adaptive Color) ----------
 let p5Colors = null;
 let p5Phase = 0;
 let p5LastFlip = 0;
-// =====================================================
+
+let lastNowSec = 0;
+
+//debug
+const DEBUG = true;
+const LOG_EVERY_N = 60;     // log once per ~1 sec at 60Hz
+const JITTER_THRESHOLD = 2; // ms deviation from ideal frame
+let frameCount = 0;
+let prevFrameMs = null;
+let rafJitterEvents = 0;
+
 
 console.log("[CONTENT] injected on", location.href);
 hydrateFromStorageAndMaybeStart(true);
 
-// =====================================================
-// Background Detection
-// =====================================================
 function hydrateFromStorageAndMaybeStart(shouldStart = false) {
   chrome.storage.local.get(
     ["autoStart", "meanAlpha", "modDepth", "checkerSize", "freq", "currentPattern"],
@@ -229,12 +232,95 @@ function pattern1Update(dt) {
   };
 }
 
+let p2ZeroCrossings = 0;
+let p2LastSign = 0;
+let p2WindowStart = performance.now();
+
 function pattern2Update(dt) {
   phase += 2 * Math.PI * FLICKER_HZ * dt;
-  return { kind: "checker", M: Math.sin(phase) };
+  const M = Math.sin(phase);
+
+  if (DEBUG) {
+    const s = Math.sign(M);
+    if (s !== 0 && s !== p2LastSign) {
+      p2ZeroCrossings++;
+      p2LastSign = s;
+    }
+
+    const now = performance.now();
+    if (now - p2WindowStart > 2000) {
+      const seconds = (now - p2WindowStart) / 1000;
+      //2 zero crossings = 1 full oscillations
+      //when sign changes is half cycle completed
+      const estFreq = (p2ZeroCrossings / 2) / seconds;//How often the computed M value changes sign.
+
+      console.log(
+        `[Pattern2] estFreq≈${estFreq.toFixed(2)}Hz`
+      );
+
+      p2ZeroCrossings = 0;
+      p2WindowStart = now;
+    }
+  }
+
+  return { kind: "checker", M };
+}
+let p3ZeroCrossings = 0;
+let p3LastSign = 0;
+let p3WindowStart = performance.now();
+function pattern3Update(t0, t1) {
+  const f = FLICKER_HZ;
+  const dt = t1 - t0;
+  if (dt <= 0) return { kind: "checker", M: 0 };
+
+  const period = 1 / f;
+  const half = period / 2;
+
+  let phaseLocal = ((t0 % period) + period) % period;
+  let remaining = dt;
+  let onTime = 0;
+
+  while (remaining > 0) {
+    const inPositive = phaseLocal < half;
+    const nextBoundary = inPositive ? half : period;
+    const segment = Math.min(remaining, nextBoundary - phaseLocal);
+
+    if (inPositive) onTime += segment;
+
+    remaining -= segment;
+    phaseLocal += segment;
+    if (phaseLocal >= period) phaseLocal -= period;
+  }
+
+  const fraction = onTime / dt;
+  const M = fraction * 2 - 1;
+
+  if (DEBUG) {
+    const s = Math.sign(M);
+    if (s !== 0 && s !== p3LastSign) {
+      p3ZeroCrossings++;
+      p3LastSign = s;
+    }
+
+    const now = performance.now();
+    if (now - p3WindowStart > 2000) {
+      const seconds = (now - p3WindowStart) / 1000;
+      const estFreq = (p3ZeroCrossings / 2) / seconds;
+
+      console.log(
+        `[Pattern3 Integrated] estFreq≈${estFreq.toFixed(2)}Hz`
+      );
+
+      p3ZeroCrossings = 0;
+      p3WindowStart = now;
+    }
+  }
+
+  return { kind: "checker", M };
 }
 
-function pattern3Update(dt) {
+
+function pattern4Update(dt) {
   phase += 2 * Math.PI * FLICKER_HZ * dt;
   const w = 0.5 + 0.5 * Math.sin(phase);
   return {
@@ -242,16 +328,6 @@ function pattern3Update(dt) {
     color: "red",
     alpha: meanAlpha + MOD_DEPTH * (w * 2 - 1),
   };
-}
-
-function pattern4Update(dt) {
-  acc += dt;
-  const half = 1 / (FLICKER_HZ * 2);
-  while (acc >= half) {
-    acc -= half;
-    squareOn = !squareOn;
-  }
-  return { kind: "checker", M: squareOn ? +1 : -1 };
 }
 
 // ---------- Pattern 5 ----------
@@ -275,34 +351,76 @@ function renderPattern5(now) {
   ctx.globalAlpha = 1;
 }
 
-// =====================================================
-// Loop
-// =====================================================
 function loop(now) {
   if (!running) return;
-  const dt = (now - lastTime) / 1000;
-  lastTime = now;
+  frameCount++;
+
+if (prevFrameMs !== null) {
+  const dtMs = now - prevFrameMs;
+  const ideal = 1000 / 60; // assuming 60Hz panel
+  const deviation = Math.abs(dtMs - ideal);
+
+  if (deviation > JITTER_THRESHOLD) {
+    rafJitterEvents++;
+  }
+  //dt is the time between two requestAnimationFrame calls.
+  if (DEBUG && frameCount % LOG_EVERY_N === 0) {
+    console.log(
+      `[RAF] dt=${dtMs.toFixed(2)}ms | jitterEvents=${rafJitterEvents}`
+    );
+    rafJitterEvents = 0;
+  }
+}
+
+prevFrameMs = now;
+
+
+  const nowSec = now / 1000;
+
+  if (lastNowSec === 0) {
+    lastNowSec = nowSec;
+    rafId = requestAnimationFrame(loop);
+    return;
+  }
+
+  const t0 = lastNowSec;
+  const t1 = nowSec;
+  const dt = t1 - t0;
+  lastNowSec = nowSec;
+
+  let cmd;
 
   if (currentPattern === 5) {
     renderPattern5(now);
-  } else {
-    const cmd = [
-      pattern1Update,
-      pattern2Update,
-      pattern3Update,
-      pattern4Update,
-    ][currentPattern - 1](dt);
-
-    if (cmd.kind === "full") drawFullScreen(cmd.color, cmd.alpha);
-    else drawCheckerboard(cmd.M);
+    rafId = requestAnimationFrame(loop);
+    return;
   }
+
+  switch (currentPattern) {
+    case 1:
+      cmd = pattern1Update(dt);
+      break;
+
+    case 2:
+      cmd = pattern2Update(dt);   // naive sine sampling
+      break;
+
+    case 3:
+      cmd = pattern3Update(t0, t1); // integrated square
+      break;
+
+    case 4:
+      cmd = pattern4Update(dt);
+      break;
+  }
+
+  if (cmd.kind === "full") drawFullScreen(cmd.color, cmd.alpha);
+  else drawCheckerboard(cmd.M);
 
   rafId = requestAnimationFrame(loop);
 }
 
-// =====================================================
-// Start / Stop
-// =====================================================
+
 function start(pattern = currentPattern) {
   ensureCanvas();
   resizeCanvas();
